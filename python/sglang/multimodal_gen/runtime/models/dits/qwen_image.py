@@ -511,6 +511,14 @@ class QwenImageTransformer2DModel(CachableDiT):
 
     """
 
+    # Shard at transformer-block granularity for FSDP inference.
+    # If we shard only the entire model as one unit, FSDP will all-gather an
+    # excessively large parameter group at pre-forward, which can OOM even on
+    # 2x 32GiB GPUs. Block-level sharding keeps the all-gather working set small.
+    _fsdp_shard_conditions = [
+        lambda n, m: m.__class__.__name__ == "QwenImageTransformerBlock"
+    ]
+
     _supports_gradient_checkpointing = True
     _no_split_modules = ["QwenImageTransformerBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]

@@ -235,9 +235,14 @@ class CudaPlatformBase(Platform):
                 set_fa_ver(4)
             target_backend = AttentionBackendEnum.FA
 
-        if not cls.has_device_capability(80):
+        # NOTE:
+        # Our FlashAttention backend is backed by `sgl_kernel.flash_attn`, which
+        # currently only supports sm90+ (Hopper/H100 and newer). For older GPUs
+        # (e.g. Ampere sm80/sm86), we must fall back to Torch SDPA.
+        if not cls.has_device_capability(90):
             logger.info(
-                "Cannot use FlashAttention backend for Volta and Turing " "GPUs."
+                "Cannot use FlashAttention backend because it requires sm90+; "
+                "falling back to Torch SDPA."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
         elif dtype not in (torch.float16, torch.bfloat16):

@@ -15,6 +15,7 @@ import torch
 from torch import nn
 from torch.distributed import DeviceMesh, init_device_mesh
 from torch.distributed._tensor import distribute_tensor
+from torch.distributed._tensor import DTensor
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -34,6 +35,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
+
+# Cache CPU device meshes for DTensor distribution to avoid repeatedly creating
+# process groups/meshes during weight loading.
+_CPU_DEVICE_MESH_CACHE: dict[tuple[tuple[int, ...], tuple[str, ...] | None], DeviceMesh] = {}
 
 
 # TODO(PY): move this to utils elsewhere
@@ -183,13 +188,6 @@ def shard_model(
     Raises:
         ValueError: If no layer modules were sharded, indicating that no shard_condition was triggered.
     """
-    if fsdp_shard_conditions is None or len(fsdp_shard_conditions) == 0:
-        logger.warning(
-            "The FSDP shard condition list is empty or None. No modules will be sharded in %s",
-            type(model).__name__,
-        )
-        return
-
     fsdp_kwargs = {
         "reshard_after_forward": reshard_after_forward,
         "mesh": mesh,
@@ -197,6 +195,15 @@ def shard_model(
     }
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=pin_cpu_memory)
+
+    if fsdp_shard_conditions is None or len(fsdp_shard_conditions) == 0:
+        logger.warning(
+            "The FSDP shard condition list is empty or None. "
+            "Falling back to sharding the entire model (%s).",
+            type(model).__name__,
+        )
+        fully_shard(model, **fsdp_kwargs)
+        return
 
     # iterating in reverse to start with
     # lowest-level modules first
@@ -251,25 +258,98 @@ def load_model_from_full_model_state_dict(
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
+
+    # When loading large models, moving each full (unsharded) tensor to CUDA before
+    # distributing can cause a transient peak memory usage and OOM. To reduce the peak,
+    # we:
+    # - materialize tensors on CPU first when cpu_offload is enabled; and
+    # - for DTensor sharded params, distribute on a CPU mesh first (creating only local shards),
+    #   then move shards to CUDA only if needed.
+    def _get_cpu_device_mesh_like(dm: DeviceMesh) -> DeviceMesh:
+        # IMPORTANT:
+        # Constructing DeviceMesh("cpu", dm.mesh, ...) may reuse a NCCL-backed
+        # process group and later fail with:
+        #   RuntimeError: No backend type associated with device type cpu
+        # when DTensor collectives (broadcast) run on CPU tensors.
+        #
+        # Using init_device_mesh("cpu", ...) ensures CPU-capable process groups
+        # (gloo) are created/used for CPU DTensor operations.
+        shape = tuple(dm.mesh.shape)
+        dim_names = getattr(dm, "mesh_dim_names", None)
+        key = (shape, tuple(dim_names) if dim_names is not None else None)
+        cached = _CPU_DEVICE_MESH_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        cpu_mesh = init_device_mesh(
+            "cpu",
+            mesh_shape=shape,
+            mesh_dim_names=dim_names,
+        )
+        _CPU_DEVICE_MESH_CACHE[key] = cpu_mesh
+        return cpu_mesh
+
     for target_param_name, full_tensor in custom_param_sd.items():
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
             raise ValueError(
                 f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
             )
+        # Choose a safe staging device to reduce peak memory.
+        staging_device = torch.device("cpu") if cpu_offload else device
+
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
-            # In cases where parts of the model aren't sharded, some parameters will be plain tensors
-            sharded_tensor = full_tensor
+            sharded_tensor = full_tensor.to(device=staging_device, dtype=param_dtype)
         else:
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
-            sharded_tensor = distribute_tensor(
-                full_tensor,
-                meta_sharded_param.device_mesh,
-                meta_sharded_param.placements,
+            # Sharded (DTensor): avoid CPU DTensor collectives (may fail with "No backend type associated with device type cpu").
+            # Instead, slice the local shard on CPU and move only the shard to CUDA.
+            full_tensor_cpu = full_tensor.to(device="cpu", dtype=param_dtype)
+
+            dm = meta_sharded_param.device_mesh
+            placements = meta_sharded_param.placements
+
+            # Find my coordinate in the mesh (works even if dm.get_coordinate() is unavailable)
+            import torch.distributed as dist
+            rank = dist.get_rank()
+            coords = (dm.mesh == rank).nonzero()
+            if coords.numel() == 0:
+                raise RuntimeError(f"Rank {rank} not found in device mesh")
+            coord = coords[0].tolist()
+
+            # Common HSDP mesh shape is (replicate, shard). Shard dim is the last axis.
+            shard_axis = len(coord) - 1
+            shard_idx = coord[shard_axis]
+            shard_world = dm.mesh.shape[shard_axis]
+
+            # Try to infer shard dim from placements (most common is Shard(dim=0))
+            shard_dim = None
+            for p in placements:
+                if getattr(p, "__class__", None) and p.__class__.__name__.lower() == "shard":
+                    shard_dim = getattr(p, "dim", None)
+                    break
+
+            if shard_dim is None:
+                # If placements are Replicate-only, just keep the full tensor (no collectives).
+                local = full_tensor_cpu
+            else:
+                # Slice local shard. chunk() matches DTensor's typical uneven split behavior.
+                chunks = torch.chunk(full_tensor_cpu, shard_world, dim=shard_dim)
+                local = chunks[shard_idx]
+
+            # Move only the local shard to CUDA if needed.
+            local = local.to(device) if not cpu_offload else local
+
+            # Wrap back into a DTensor so that load_state_dict sees the correct
+            # *global* shape (avoids "size mismatch ... got 1536 vs 3072" errors).
+            sharded_tensor = DTensor.from_local(
+                local,
+                device_mesh=dm,
+                placements=placements,
+                run_check=False,
+                shape=full_tensor_cpu.shape,
+                stride=full_tensor_cpu.stride(),
             )
-            if cpu_offload:
-                sharded_tensor = sharded_tensor.to("cpu")
+
         sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping

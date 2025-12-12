@@ -7,8 +7,32 @@ from transformers import (
     DynamicCache,
     PretrainedConfig,
     Qwen2_5_VLTextConfig,
-    Qwen2RMSNorm,
 )
+
+# NOTE:
+# Some transformers versions do not export Qwen2RMSNorm at the package top-level.
+# Import it from the implementation module(s) as a fallback for compatibility.
+try:
+    from transformers import Qwen2RMSNorm  # type: ignore
+except Exception:  # pragma: no cover
+    Qwen2RMSNorm = None  # type: ignore
+    _import_errors = []
+    for _mod_path in (
+        "transformers.models.qwen2.modeling_qwen2",
+        "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
+        "transformers.models.qwen2_vl.modeling_qwen2_vl",
+    ):
+        try:
+            _m = __import__(_mod_path, fromlist=["Qwen2RMSNorm"])
+            Qwen2RMSNorm = getattr(_m, "Qwen2RMSNorm")  # type: ignore
+            break
+        except Exception as _e:  # pragma: no cover
+            _import_errors.append(f"{_mod_path}: {_e}")
+    if Qwen2RMSNorm is None:  # pragma: no cover
+        raise ImportError(
+            "Failed to import Qwen2RMSNorm from transformers. Tried: "
+            + ", ".join(_import_errors)
+        )
 from transformers.masking_utils import (
     create_causal_mask,
     create_sliding_window_causal_mask,
@@ -391,7 +415,21 @@ class Qwen2_5_VLTextModel(nn.Module):
 
         # torch.jit.trace() doesn't support cache objects in the output
         if use_cache and past_key_values is None and not torch.jit.is_tracing():
-            past_key_values = DynamicCache(config=self.config)
+            # NOTE:
+            # transformers' cache internals (DynamicCache/DynamicLayer) change across versions.
+            # On some versions (e.g. transformers==4.55.2), DynamicCache(config=...) may fail with:
+            #   CacheLayerMixin.__init__() got an unexpected keyword argument 'max_cache_len'
+            # For our use-case in sglang-diffusion (prompt/image encoding), KV cache is not required.
+            # So we gracefully disable caching if cache initialization fails.
+            try:
+                past_key_values = DynamicCache(config=self.config)
+            except TypeError as e:
+                logger.warning(
+                    "Disabling KV cache due to DynamicCache init incompatibility: %r",
+                    e,
+                )
+                use_cache = False
+                past_key_values = None
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)

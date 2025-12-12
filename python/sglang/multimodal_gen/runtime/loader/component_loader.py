@@ -155,6 +155,13 @@ class ComponentLoader(ABC):
             )
             source = "customized"
         except Exception as _e:
+            logger.warning(
+                "Failed to load customized %s; falling back to native (%s). Reason: %r",
+                module_name,
+                transformers_or_diffusers,
+                _e,
+                exc_info=True,
+            )
             # fallback to native version
             component = self.load_native(
                 component_model_path, server_args, transformers_or_diffusers
@@ -602,6 +609,10 @@ class VAELoader(ComponentLoader):
 
 class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
+
+    def should_offload(self, server_args, model_config: ModelConfig | None = None):
+        # Only offload DiT/transformer to CPU if explicitly requested.
+        return bool(server_args.dit_cpu_offload)
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args

@@ -589,6 +589,49 @@ class DenoisingStage(PipelineStage):
             },
         )
 
+        # Robust rotary_emb resolution:
+        # - Some wrappers (torch.compile / DDP-like) hide attributes behind `_orig_mod` or `.module`.
+        # - If customized QwenImage transformer failed to load and we fell back to native,
+        #   `rotary_emb` may not exist; in that case, provide a compatible fallback rope
+        #   to avoid crashing in pipeline_config.get_freqs_cis().
+        transformer_for_attr = self.transformer
+        for _attr in ("_orig_mod", "module"):
+            if hasattr(transformer_for_attr, _attr) and getattr(transformer_for_attr, _attr) is not None:
+                transformer_for_attr = getattr(transformer_for_attr, _attr)
+
+        rotary_emb = getattr(transformer_for_attr, "rotary_emb", None)
+        if rotary_emb is None:
+            try:
+                from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+                    QwenImageEditPipelineConfig,
+                    QwenImagePipelineConfig,
+                )
+
+                if isinstance(
+                    server_args.pipeline_config,
+                    (QwenImagePipelineConfig, QwenImageEditPipelineConfig),
+                ):
+                    from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+                        QwenEmbedRope,
+                    )
+
+                    if (
+                        not hasattr(self, "_qwen_fallback_rope")
+                        or self._qwen_fallback_rope is None
+                    ):
+                        axes_dims_rope = (
+                            server_args.pipeline_config.dit_config.arch_config.axes_dims_rope
+                        )
+                        self._qwen_fallback_rope = QwenEmbedRope(
+                            theta=10000,
+                            axes_dim=list(axes_dims_rope),
+                            scale_rope=True,
+                        )
+                    rotary_emb = self._qwen_fallback_rope
+            except Exception:
+                # Leave rotary_emb as None; downstream may not require it for other pipelines.
+                rotary_emb = rotary_emb
+
         pos_cond_kwargs = self.prepare_extra_func_kwargs(
             self.transformer.forward,
             {
@@ -598,7 +641,7 @@ class DenoisingStage(PipelineStage):
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
                 self.device,
-                getattr(self.transformer, "rotary_emb", None),
+                rotary_emb,
                 dtype=target_dtype,
             ),
         )
@@ -613,7 +656,7 @@ class DenoisingStage(PipelineStage):
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
                     self.device,
-                    getattr(self.transformer, "rotary_emb", None),
+                    rotary_emb,
                     dtype=target_dtype,
                 ),
             )
