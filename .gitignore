@@ -252,3 +252,7 @@ outputs/
 
 # Eval Cache
 .longbench_cache/
+
+
+# Qwen-Image-Edit
+test_edit/

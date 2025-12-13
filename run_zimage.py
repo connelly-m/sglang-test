@@ -5,6 +5,11 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(current_dir, "python"))
 
+# 更容易跑通流程的显存/碎片规避设置（会略影响性能，主要是更稳）
+# 需要在 torch 初始化 CUDA allocator 之前设置
+# 注意：PYTORCH_CUDA_ALLOC_CONF 已弃用，改用 PYTORCH_ALLOC_CONF
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 from sglang.multimodal_gen import DiffGenerator
 
 
@@ -19,14 +24,19 @@ def main():
         attention_backend="torch_sdpa",
         # 显存紧张时建议开启 FSDP 推理分片，让 DiT 权重按 GPU 维度切分，降低单卡占用
         use_fsdp_inference=True,
-        # 避免 denoising 阶段把 DiT 从 CPU 搬到 GPU 触发显存峰值 OOM
+        # 注意：当前配置下 use_fsdp_inference=True 时，Torch FSDP 的 CPU offload
+        # 需要参数在 CPU 上 materialize，否则会报错。
+        # 为了先跑通流程：保留 FSDP 分片（省显存），先关闭 DiT CPU offload。
+        # 代价：显存占用会上升，但我们已降低分辨率+VAE fp16/tiling 来兜底。
         dit_cpu_offload=False,
-        # 尝试关闭 CPU offload 以减少系统内存占用（前提是显存足够）
-        # dit_cpu_offload=False,
-        # text_encoder_cpu_offload=False,
-        # image_encoder_cpu_offload=False,
-        # vae_cpu_offload=False,
-        # pin_cpu_memory=True,
+        text_encoder_cpu_offload=True,
+        image_encoder_cpu_offload=True,
+        vae_cpu_offload=True,
+        pin_cpu_memory=True,
+        # VAE 设置：Qwen-Image 默认 vae_tiling=False 且 vae_precision 可能是 fp32，
+        # 这会显著增大 decode 显存。为了跑通，强制 fp16 + tiling（更省显存但更慢）。
+        vae_precision="fp16",
+        vae_tiling=True,
     )
 
     # 2. 使用上下文管理器自动处理资源释放
@@ -37,11 +47,14 @@ def main():
         output = generator.generate(
             sampling_params_kwargs=dict(
                 # Qwen-Image-Edit 是图片编辑模型，需要提供 prompt 和 image_path
-                prompt="把图中的人物换成亚洲人种,中国青少年,头发是微分碎盖，戴着黑框眼镜",
+                prompt="把图中的人物换成亚洲人种,中国青少年,头发是长发微分碎盖，戴着黑框眼镜",
                 image_path="/mnt/yx/sglang/test.jpg", # 请替换为实际的图片路径
                 
                 # 图片生成通常只有一帧
                 num_frames=1,
+                # 为了先跑通流程，先用更小分辨率（会牺牲画质与细节，但显著省显存/更快）
+                height=512,
+                width=512,
                 
                 # 其他参数
                 save_output=True,
