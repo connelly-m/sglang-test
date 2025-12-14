@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
@@ -259,6 +260,72 @@ def load_model_from_full_model_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
 
+    def _maybe_slice_for_tp(
+        name: str, full_tensor: torch.Tensor, expected: torch.Tensor
+    ) -> torch.Tensor:
+        """Slice a full (unsharded) tensor to match TP-sharded parameter shapes.
+
+        The TP layers in sglang create parameters with per-partition shapes, and
+        rely on custom weight loaders to slice the checkpoint tensors at load time.
+        This FSDP loader uses load_state_dict(assign=True), so we must slice here
+        so that shapes match.
+        """
+        tp_size = get_tp_world_size()
+        if tp_size <= 1:
+            return full_tensor
+        if full_tensor.shape == expected.shape:
+            return full_tensor
+
+        tp_rank = get_tp_rank()
+
+        # Handle scalar tensors (e.g., some scales) - nothing to slice.
+        if full_tensor.ndim == 0 or expected.ndim == 0:
+            return full_tensor
+
+        # 1D: shard along dim0.
+        if full_tensor.ndim == 1 and expected.ndim == 1:
+            if full_tensor.shape[0] == expected.shape[0] * tp_size:
+                shard = expected.shape[0]
+                return full_tensor.narrow(0, tp_rank * shard, shard)
+            return full_tensor
+
+        # 2D: shard either rows (dim0, column-parallel) or cols (dim1, row-parallel).
+        if full_tensor.ndim == 2 and expected.ndim == 2:
+            # Column-parallel: output dim is sharded (dim0).
+            if (
+                full_tensor.shape[0] == expected.shape[0] * tp_size
+                and full_tensor.shape[1] == expected.shape[1]
+            ):
+                shard = expected.shape[0]
+                return full_tensor.narrow(0, tp_rank * shard, shard)
+
+            # Row-parallel: input dim is sharded (dim1).
+            if (
+                full_tensor.shape[1] == expected.shape[1] * tp_size
+                and full_tensor.shape[0] == expected.shape[0]
+            ):
+                shard = expected.shape[1]
+                return full_tensor.narrow(1, tp_rank * shard, shard)
+
+            return full_tensor
+
+        # Higher-rank tensors: only try to shard the first dimension if it matches.
+        if (
+            full_tensor.shape[0] == expected.shape[0] * tp_size
+            and full_tensor.shape[1:] == expected.shape[1:]
+        ):
+            shard = expected.shape[0]
+            return full_tensor.narrow(0, tp_rank * shard, shard)
+
+        logger.debug(
+            "TP slicing skipped for %s: checkpoint=%s expected=%s tp_size=%s",
+            name,
+            tuple(full_tensor.shape),
+            tuple(expected.shape),
+            tp_size,
+        )
+        return full_tensor
+
     # When loading large models, moving each full (unsharded) tensor to CUDA before
     # distributing can cause a transient peak memory usage and OOM. To reduce the peak,
     # we:
@@ -295,6 +362,10 @@ def load_model_from_full_model_state_dict(
             raise ValueError(
                 f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
             )
+        # Slice full tensor for TP first (so shapes match the model's TP-sharded params).
+        full_tensor = _maybe_slice_for_tp(
+            target_param_name, full_tensor, meta_sharded_param
+        )
         # Choose a safe staging device to reduce peak memory.
         staging_device = torch.device("cpu") if cpu_offload else device
 

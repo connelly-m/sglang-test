@@ -20,23 +20,23 @@ def main():
         # 开启TP=2，注意这里num_gpus也需要设为2，因为通常num_gpus=tp_size * dp_size
         tp_size=2,
         num_gpus=2,
-        enable_torch_compile=False,
+        # enable_torch_compile=False,
         attention_backend="torch_sdpa",
         # 显存紧张时建议开启 FSDP 推理分片，让 DiT 权重按 GPU 维度切分，降低单卡占用
-        use_fsdp_inference=True,
+        # use_fsdp_inference=True,
         # 注意：当前配置下 use_fsdp_inference=True 时，Torch FSDP 的 CPU offload
         # 需要参数在 CPU 上 materialize，否则会报错。
         # 为了先跑通流程：保留 FSDP 分片（省显存），先关闭 DiT CPU offload。
         # 代价：显存占用会上升，但我们已降低分辨率+VAE fp16/tiling 来兜底。
-        dit_cpu_offload=False,
-        text_encoder_cpu_offload=True,
-        image_encoder_cpu_offload=True,
+        # dit_cpu_offload=False,
+        # text_encoder_cpu_offload=True,
+        # image_encoder_cpu_offload=True,
         vae_cpu_offload=True,
-        pin_cpu_memory=True,
+        # pin_cpu_memory=True,
         # VAE 设置：Qwen-Image 默认 vae_tiling=False 且 vae_precision 可能是 fp32，
         # 这会显著增大 decode 显存。为了跑通，强制 fp16 + tiling（更省显存但更慢）。
-        vae_precision="fp16",
-        vae_tiling=True,
+        # vae_precision="fp16",
+        # vae_tiling=True,
     )
 
     # 2. 使用上下文管理器自动处理资源释放
@@ -53,8 +53,8 @@ def main():
                 # 图片生成通常只有一帧
                 num_frames=1,
                 # 为了先跑通流程，先用更小分辨率（会牺牲画质与细节，但显著省显存/更快）
-                height=512,
-                width=512,
+                # height=512,
+                # width=512,
                 
                 # 其他参数
                 save_output=True,

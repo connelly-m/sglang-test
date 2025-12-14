@@ -14,9 +14,14 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     apply_rotary_embedding,
     fuse_scale_shift_kernel,
@@ -26,6 +31,22 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+
+class _TensorOnlyColumnParallelLinear(ColumnParallelLinear):
+    """ColumnParallelLinear but returns only output tensor (nn.Linear-like)."""
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        output, _ = super().forward(input_)
+        return output
+
+
+class _TensorOnlyRowParallelLinear(RowParallelLinear):
+    """RowParallelLinear but returns only output tensor (nn.Linear-like)."""
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        output, _ = super().forward(input_)
+        return output
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -233,47 +254,99 @@ class QwenImageCrossAttention(nn.Module):
         context_pre_only: bool = False,
         parallel_attention=False,
         out_dim: int = None,
+        tp_enabled: bool = True,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.dim = dim  # full hidden size (replicated activations)
+        self.total_num_heads = num_heads
+        self.head_dim = head_dim
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
         self.parallel_attention = parallel_attention
+        self.tp_size = get_tp_world_size()
+        self.tp_enabled = bool(tp_enabled and self.tp_size > 1)
+        if self.tp_enabled:
+            assert (
+                self.total_num_heads % self.tp_size == 0
+            ), f"num_heads ({self.total_num_heads}) must be divisible by tp_size ({self.tp_size})"
+            self.num_heads = divide(self.total_num_heads, self.tp_size)
+        else:
+            self.num_heads = self.total_num_heads
 
         # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
+        if self.tp_enabled:
+            # Shard head dimension: each rank produces local heads (dim/tp).
+            self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+            self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+            self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        else:
+            self.to_q = ReplicatedLinear(dim, dim)
+            self.to_k = ReplicatedLinear(dim, dim)
+            self.to_v = ReplicatedLinear(dim, dim)
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
-        self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
+        # Keep "inner_dim" in global (non-sharded) convention; TP is applied inside linear layers.
+        self.inner_dim = out_dim if out_dim is not None else dim
         self.inner_kv_dim = self.inner_dim
         if added_kv_proj_dim is not None:
-            self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
-            )
-            self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
-            )
-            if context_pre_only is not None:
-                self.add_q_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True
+            if self.tp_enabled:
+                self.add_k_proj = ColumnParallelLinear(
+                    added_kv_proj_dim, self.inner_kv_dim, bias=True, gather_output=False
                 )
+                self.add_v_proj = ColumnParallelLinear(
+                    added_kv_proj_dim, self.inner_kv_dim, bias=True, gather_output=False
+                )
+            else:
+                self.add_k_proj = ReplicatedLinear(
+                    added_kv_proj_dim, self.inner_kv_dim, bias=True
+                )
+                self.add_v_proj = ReplicatedLinear(
+                    added_kv_proj_dim, self.inner_kv_dim, bias=True
+                )
+            if context_pre_only is not None:
+                if self.tp_enabled:
+                    self.add_q_proj = ColumnParallelLinear(
+                        added_kv_proj_dim,
+                        self.inner_dim,
+                        bias=True,
+                        gather_output=False,
+                    )
+                else:
+                    self.add_q_proj = ReplicatedLinear(
+                        added_kv_proj_dim, self.inner_dim, bias=True
+                    )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            if self.tp_enabled:
+                self.to_add_out = RowParallelLinear(
+                    self.inner_dim,
+                    self.dim,
+                    bias=out_bias,
+                    input_is_parallel=True,
+                    reduce_results=True,
+                )
+            else:
+                self.to_add_out = ReplicatedLinear(
+                    self.inner_dim, self.dim, bias=out_bias
+                )
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+                RowParallelLinear(
+                    self.inner_dim,
+                    self.dim,
+                    bias=out_bias,
+                    input_is_parallel=True,
+                    reduce_results=True,
+                )
+                if self.tp_enabled
+                else ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
             )
         else:
             self.to_out = None
@@ -283,7 +356,7 @@ class QwenImageCrossAttention(nn.Module):
 
         # Scaled dot product attention
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -393,14 +466,24 @@ class QwenImageTransformerBlock(nn.Module):
         self.dim = dim
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
+        self.tp_enabled = get_tp_world_size() > 1
 
         # Image processing modules
-        self.img_mod = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
-            ),  # For scale, shift, gate for norm1 and norm2
-        )
+        if self.tp_enabled:
+            # Keep full output (6*dim) for downstream chunking, but shard weights.
+            self.img_mod = nn.Sequential(
+                nn.SiLU(),
+                _TensorOnlyColumnParallelLinear(
+                    dim, 6 * dim, bias=True, gather_output=True
+                ),
+            )
+        else:
+            self.img_mod = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(
+                    dim, 6 * dim, bias=True
+                ),  # For scale, shift, gate for norm1 and norm2
+            )
         self.img_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
 
         self.attn = QwenImageCrossAttention(
@@ -409,6 +492,7 @@ class QwenImageTransformerBlock(nn.Module):
             added_kv_proj_dim=dim,
             context_pre_only=False,
             head_dim=attention_head_dim,
+            tp_enabled=self.tp_enabled,
         )
         self.img_norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.img_mlp = FeedForward(
@@ -416,17 +500,80 @@ class QwenImageTransformerBlock(nn.Module):
         )
 
         # Text processing modules
-        self.txt_mod = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
-            ),  # For scale, shift, gate for norm1 and norm2
-        )
+        if self.tp_enabled:
+            self.txt_mod = nn.Sequential(
+                nn.SiLU(),
+                _TensorOnlyColumnParallelLinear(
+                    dim, 6 * dim, bias=True, gather_output=True
+                ),
+            )
+        else:
+            self.txt_mod = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(
+                    dim, 6 * dim, bias=True
+                ),  # For scale, shift, gate for norm1 and norm2
+            )
         self.txt_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
         self.txt_norm2 = LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
+        )
+
+        if self.tp_enabled:
+            # Convert diffusers FeedForward's internal linears to TP versions,
+            # while preserving original parameter names for checkpoint loading.
+            self._tpify_feedforward(self.img_mlp)
+            self._tpify_feedforward(self.txt_mlp)
+
+    def _tpify_feedforward(self, ff: nn.Module) -> None:
+        """In-place replace FeedForward internal Linear layers with TP linears.
+
+        Expected diffusers FeedForward structure:
+          ff.net[0].proj: Linear(dim -> hidden)
+          ff.net[2]: Linear(hidden -> dim)
+
+        We shard the first projection (column-parallel) and make the second
+        projection row-parallel with all-reduce, matching standard TP MLP.
+        """
+        if not hasattr(ff, "net"):
+            logger.warning("FeedForward has no attribute `net`; skip TP-ification.")
+            return
+        net = getattr(ff, "net")
+        if not (hasattr(net, "__len__") and len(net) >= 3):
+            logger.warning("FeedForward.net has unexpected structure; skip TP-ification.")
+            return
+        if not hasattr(net[0], "proj"):
+            logger.warning("FeedForward.net[0] has no `proj`; skip TP-ification.")
+            return
+        proj0 = net[0].proj
+        lin2 = net[2]
+        if not isinstance(proj0, nn.Linear) or not isinstance(lin2, nn.Linear):
+            logger.warning(
+                "FeedForward internal layers are not nn.Linear; skip TP-ification."
+            )
+            return
+        if proj0.out_features != lin2.in_features:
+            logger.warning(
+                "FeedForward proj/out mismatch (%s vs %s); skip TP-ification.",
+                proj0.out_features,
+                lin2.in_features,
+            )
+            return
+
+        net[0].proj = _TensorOnlyColumnParallelLinear(
+            proj0.in_features,
+            proj0.out_features,
+            bias=(proj0.bias is not None),
+            gather_output=False,
+        )
+        net[2] = _TensorOnlyRowParallelLinear(
+            lin2.in_features,
+            lin2.out_features,
+            bias=(lin2.bias is not None),
+            input_is_parallel=True,
+            reduce_results=True,
         )
 
     def _modulate(self, x, mod_params):

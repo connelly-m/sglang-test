@@ -116,13 +116,27 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
-        self.vae = self.vae.to(get_local_torch_device())
-        latents = latents.to(get_local_torch_device())
+        # IMPORTANT:
+        # - TP sharding only affects the DiT/transformer stage.
+        # - If vae_cpu_offload=True, we should NOT force the VAE onto CUDA here,
+        #   otherwise decode will still OOM on GPU even though the user requested offload.
+        decode_device = (
+            torch.device("cpu") if server_args.vae_cpu_offload else get_local_torch_device()
+        )
+        if decode_device.type == "cuda" and torch.cuda.is_available():
+            # Reduce fragmentation peaks between denoising -> decoding.
+            torch.cuda.empty_cache()
+        self.vae = self.vae.to(decode_device)
+        latents = latents.to(decode_device)
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        # CPU autocast does not support fp16 reliably; fall back to fp32 on CPU.
+        if decode_device.type == "cpu" and vae_dtype == torch.float16:
+            vae_dtype = torch.float32
+
         vae_autocast_enabled = (
             vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        ) and (not server_args.disable_autocast)
 
         # scale and shift
         latents = self.scale_and_shift(latents, server_args)
@@ -133,7 +147,7 @@ class DecodingStage(PipelineStage):
 
         # Decode latents
         with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+            device_type=decode_device.type, dtype=vae_dtype, enabled=vae_autocast_enabled
         ):
             try:
                 # TODO: make it more specific
