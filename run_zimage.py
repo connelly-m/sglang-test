@@ -47,14 +47,23 @@ def main():
         output = generator.generate(
             sampling_params_kwargs=dict(
                 # Qwen-Image-Edit 是图片编辑模型，需要提供 prompt 和 image_path
-                prompt="把图中的人物换成亚洲人种,中国青少年,头发是长发微分碎盖，戴着黑框眼镜",
-                image_path="/mnt/yx/sglang/test.jpg", # 请替换为实际的图片路径
+                prompt="A cozy consultation room with warm lighting, Michelle Snicker sitting behind a wooden desk wearing a white blouse, holding a clipboard with one hand while resting her elbow on the desk, her eyebrows slightly raised as she looks directly at the camera with a professional yet curious expression.",
+                image_path="/mnt/yx/sglang/probe-xinlinmo.png", # 请替换为实际的图片路径
                 
                 # 图片生成通常只有一帧
                 num_frames=1,
+                # 对齐随机性：显式固定 seed（两边要用同一个）
+                seed=0,
+                # 对齐 generator 在 CUDA 上生成随机噪声（与 fluxKontext-server 一致）
+                generator_device="cuda",
                 # 为了先跑通流程，先用更小分辨率（会牺牲画质与细节，但显著省显存/更快）
-                # height=512,
-                # width=512,
+                height=1060,
+                width=640,
+                # flux-kontext: steps
+                num_inference_steps=20,
+                # flux-kontext: true_cfg_scale（CFG 强度）
+                guidance_scale=3.0,
+                negative_prompt=None,
                 
                 # 其他参数
                 save_output=True,

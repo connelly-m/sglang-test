@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xinlin-test
+  namespace: prd-xchat
+spec:
+  imagePullSecrets:
+    - name: xverse-sh-v1
+  containers:
+  - name: main
+    image: xverse-sh.tencentcloudcr.com/llm/sglang:sglang-diffusion-f0e948a-rtx5090-cu129-v4
+    command:
+      - sleep
+      - infinity
+    env:
+      - name: HTTP_PORT
+        value: "8000"
+      - name: GRPC_PORT
+        value: "8001"
+    resources:
+      limits:
+        cpu: "16"
+        memory: 256Gi
+        nvidia.com/gpu: "2"
+      requests:
+        cpu: "16"
+        memory: 256Gi
+        nvidia.com/gpu: "2"
+    volumeMounts:
+      - mountPath: /mnt/yx
+        name: llm-dataset-hostpath
+  volumes:
+    - name: llm-dataset-hostpath
+      hostPath:
+        path: /mnt/yx

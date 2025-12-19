@@ -45,7 +45,13 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     height = batch.height
     width = batch.width
     vae_scale_factor = server_args.pipeline_config.vae_config.vae_scale_factor
-    image_seq_len = (int(height) // vae_scale_factor) * (int(width) // vae_scale_factor)
+    # Qwen-Image latents are "packed" into 2x2 patches (see _pack_latents),
+    # so the effective image token grid is downsampled by an extra factor of 2
+    # on both H and W compared to vanilla VAE scale.
+    #
+    # This should match diffusers QwenImage pipelines where `image_seq_len`
+    # is computed from `latents.shape[1]`.
+    image_seq_len = (int(height) // (vae_scale_factor * 2)) * (int(width) // (vae_scale_factor * 2))
 
     mu = calculate_shift(
         image_seq_len,
