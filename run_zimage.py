@@ -48,7 +48,7 @@ def main():
             sampling_params_kwargs=dict(
                 # Qwen-Image-Edit 是图片编辑模型，需要提供 prompt 和 image_path
                 prompt="A cozy consultation room with warm lighting, Michelle Snicker sitting behind a wooden desk wearing a white blouse, holding a clipboard with one hand while resting her elbow on the desk, her eyebrows slightly raised as she looks directly at the camera with a professional yet curious expression.",
-                image_path="/mnt/yx/sglang/probe-xinlinmo.png", # 请替换为实际的图片路径
+                image_path="/mnt/yx/sglang/probe.jpg", # 请替换为实际的图片路径
                 
                 # 图片生成通常只有一帧
                 num_frames=1,
