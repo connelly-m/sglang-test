@@ -257,4 +257,4 @@ outputs/
 # Qwen-Image-Edit
 test_edit/
 sglang_bench_outputs/
-sglang_bench/
+sglang_bench/outputs/
