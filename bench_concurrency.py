@@ -243,7 +243,7 @@ def main() -> int:
         width=int(args.width),
         num_inference_steps=int(args.num_inference_steps),
         guidance_scale=float(args.guidance_scale),
-        save_output=False,
+        save_output=True,
         return_frames=False,
         output_path="/mnt/yx/sglang/sglang_bench_outputs",
     )
