@@ -31,7 +31,9 @@ def main():
         # dit_cpu_offload=False,
         # text_encoder_cpu_offload=True,
         # image_encoder_cpu_offload=True,
-        vae_cpu_offload=True,
+        vae_cpu_offload=False,
+        vae_precision="bf16", 
+        vae_tiling=True,
         # pin_cpu_memory=True,
         # VAE 设置：Qwen-Image 默认 vae_tiling=False 且 vae_precision 可能是 fp32，
         # 这会显著增大 decode 显存。为了跑通，强制 fp16 + tiling（更省显存但更慢）。

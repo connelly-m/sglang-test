@@ -219,7 +219,7 @@ def main() -> int:
         guidance_scale=float(args.guidance_scale),
         save_output=False,
         return_frames=False,
-        output_path="/tmp/sglang_bench_outputs",
+        output_path="/mnt/yx/sglang/sglang_bench_outputs",
     )
 
     total = int(args.requests)
