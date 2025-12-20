@@ -250,6 +250,11 @@ def main() -> int:
     ap.add_argument("--guidance-scale", type=float, default=DEFAULT_GUIDANCE_SCALE)
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--shuffle-seeds", action="store_true")
+    ap.add_argument(
+        "--fixed-seed",
+        action="store_true",
+        help="If set, all requests (warmup+main) reuse the same --seed. Useful for determinism debugging.",
+    )
 
     ap.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)
     ap.add_argument("--num-gpus", type=int, default=DEFAULT_NUM_GPUS)
@@ -334,9 +339,14 @@ def main() -> int:
     warmup = int(args.warmup)
     conc = int(args.concurrency)
 
-    seeds = [int(args.seed) + i for i in range(total + warmup)]
-    if args.shuffle_seeds:
-        random.shuffle(seeds)
+    if args.fixed_seed:
+        seeds = [int(args.seed)] * (total + warmup)
+        if args.shuffle_seeds:
+            print("[WARN] --shuffle-seeds 与 --fixed-seed 同时开启时无意义，已忽略 shuffle。")
+    else:
+        seeds = [int(args.seed) + i for i in range(total + warmup)]
+        if args.shuffle_seeds:
+            random.shuffle(seeds)
 
     ctx = get_context("spawn")
     task_q = ctx.Queue(maxsize=total + warmup + conc)
