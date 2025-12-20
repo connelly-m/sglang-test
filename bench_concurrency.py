@@ -37,12 +37,17 @@ sys.path.insert(0, os.path.join(current_dir, "python"))
 
 # 默认“写死”的压测参数：对齐 sglang/run_zimage.py 的单次请求
 DEFAULT_MODEL_PATH = "/mnt/yx/Qwen/Qwen-Image-Edit"
-DEFAULT_IMAGE_PATH = "/mnt/yx/sglang/probe.jpg"
-DEFAULT_PROMPT = (
-    "A cozy consultation room with warm lighting, Michelle Snicker sitting behind a wooden desk wearing a white blouse, "
-    "holding a clipboard with one hand while resting her elbow on the desk, her eyebrows slightly raised as she looks "
-    "directly at the camera with a professional yet curious expression."
-)
+DEFAULT_IMAGE_DIR = "sglang_bench/inputs"
+DEFAULT_OUTPUT_DIR = "sglang_bench/outputs"
+DEFAULT_NUM_INPUTS = 4
+
+# 默认 prompts：用于图片编辑/改写类任务；实际内容你可以用 --prompt-file 覆盖
+DEFAULT_PROMPTS: list[str] = [
+    "Enhance the overall lighting and contrast to look more professional and clean, keep the subject unchanged.",
+    "Change the background to a cozy modern cafe while keeping the main subject consistent and realistic.",
+    "Apply a cinematic cyberpunk night style with neon lights, preserve composition and key details.",
+    "Convert the image into a soft watercolor illustration style, keep the main elements recognizable.",
+]
 DEFAULT_NEGATIVE_PROMPT = None
 DEFAULT_HEIGHT = 1060
 DEFAULT_WIDTH = 640
@@ -181,6 +186,9 @@ def _worker_main(
     scheduler_host: str,
     scheduler_port: int,
     request_timeout_ms: int,
+    image_paths: List[str],
+    prompts: List[str],
+    output_dir: str,
 ):
     import zmq
 
@@ -202,11 +210,17 @@ def _worker_main(
             continue
         if item is None:
             break
-        seed, request_id = item
+        seed, request_id, item_idx = item
         try:
             sampling_kwargs = dict(sampling_template)
             sampling_kwargs["seed"] = int(seed)
             sampling_kwargs["request_id"] = request_id
+            sampling_kwargs["image_path"] = image_paths[item_idx % len(image_paths)]
+            sampling_kwargs["prompt"] = prompts[item_idx % len(prompts)]
+            sampling_kwargs["output_path"] = output_dir
+            sampling_kwargs[
+                "output_file_name"
+            ] = f"img{(item_idx % len(image_paths)) + 1}_seed{int(seed)}_{request_id}.png"
             _, req = _build_req(server_args_kwargs, sampling_kwargs)
 
             t0 = time.perf_counter()
@@ -241,8 +255,25 @@ def _maybe_start_server(server_args_kwargs: Dict[str, Any]):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
-    ap.add_argument("--image-path", default=DEFAULT_IMAGE_PATH)
-    ap.add_argument("--prompt", default=DEFAULT_PROMPT)
+    ap.add_argument("--image-dir", default=DEFAULT_IMAGE_DIR, help="Directory containing input images.")
+    ap.add_argument(
+        "--image-paths",
+        default=None,
+        help="Comma-separated list of image paths. Overrides --image-dir.",
+    )
+    ap.add_argument("--prompt-file", default=None, help="Text file with one prompt per line.")
+    ap.add_argument(
+        "--prompts",
+        default=None,
+        help="Optional prompts list separated by '||'. Overrides --prompt-file and defaults.",
+    )
+    ap.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory for saved images.")
+    ap.add_argument(
+        "--num-inputs",
+        type=int,
+        default=DEFAULT_NUM_INPUTS,
+        help="How many images/prompts to cycle through (default: 4).",
+    )
     ap.add_argument("--negative-prompt", default=None)
     ap.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     ap.add_argument("--width", type=int, default=DEFAULT_WIDTH)
@@ -252,8 +283,9 @@ def main() -> int:
     ap.add_argument("--shuffle-seeds", action="store_true")
     ap.add_argument(
         "--fixed-seed",
-        action="store_true",
-        help="If set, all requests (warmup+main) reuse the same --seed. Useful for determinism debugging.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to reuse the same --seed for all requests. Default: True.",
     )
 
     ap.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)
@@ -295,6 +327,42 @@ def main() -> int:
     if args.negative_prompt is None:
         args.negative_prompt = DEFAULT_NEGATIVE_PROMPT
 
+    # Resolve image paths
+    if args.image_paths:
+        image_paths = [p.strip() for p in str(args.image_paths).split(",") if p.strip()]
+    else:
+        # List files from image-dir, filter common image suffixes
+        img_dir = str(args.image_dir)
+        try:
+            names = sorted(os.listdir(img_dir))
+        except FileNotFoundError:
+            # fallback: treat image_dir as relative to current_dir
+            img_dir = os.path.join(current_dir, str(args.image_dir))
+            names = sorted(os.listdir(img_dir))
+        exts = (".jpg", ".jpeg", ".png", ".webp")
+        image_paths = [os.path.join(img_dir, n) for n in names if n.lower().endswith(exts)]
+
+    if not image_paths:
+        raise SystemExit(f"[bench] no images found under: {args.image_dir} (or --image-paths empty)")
+
+    # Keep only the first N inputs (default: 4)
+    n_inputs = max(1, int(args.num_inputs))
+    image_paths = image_paths[:n_inputs]
+
+    # Resolve prompts
+    prompts: List[str]
+    if args.prompts:
+        prompts = [p.strip() for p in str(args.prompts).split("||") if p.strip()]
+    elif args.prompt_file:
+        with open(str(args.prompt_file), "r", encoding="utf-8") as f:
+            prompts = [ln.strip() for ln in f.readlines() if ln.strip()]
+    else:
+        prompts = list(DEFAULT_PROMPTS)
+
+    if not prompts:
+        raise SystemExit("[bench] prompts list is empty")
+    prompts = prompts[:n_inputs] if len(prompts) >= n_inputs else prompts
+
     server_args_kwargs: Dict[str, Any] = dict(
         model_path=args.model_path,
         tp_size=int(args.tp_size),
@@ -322,9 +390,9 @@ def main() -> int:
             print("[WARN] 未指定 --scheduler-host，默认 localhost；若 client 不在 server 同机请显式指定。")
 
     sampling_template: Dict[str, Any] = dict(
-        prompt=args.prompt,
+        prompt=prompts[0],
         negative_prompt=args.negative_prompt,
-        image_path=args.image_path,
+        image_path=image_paths[0],
         num_frames=1,
         height=int(args.height),
         width=int(args.width),
@@ -332,14 +400,14 @@ def main() -> int:
         guidance_scale=float(args.guidance_scale),
         save_output=True,
         return_frames=False,
-        output_path="/mnt/yx/sglang/sglang_bench_outputs",
+        output_path=str(args.output_dir),
     )
 
     total = int(args.requests)
     warmup = int(args.warmup)
     conc = int(args.concurrency)
 
-    if args.fixed_seed:
+    if bool(args.fixed_seed):
         seeds = [int(args.seed)] * (total + warmup)
         if args.shuffle_seeds:
             print("[WARN] --shuffle-seeds 与 --fixed-seed 同时开启时无意义，已忽略 shuffle。")
@@ -364,6 +432,9 @@ def main() -> int:
                 scheduler_host,
                 scheduler_port,
                 int(args.request_timeout_ms),
+                image_paths,
+                prompts,
+                str(args.output_dir),
             ),
             daemon=True,
         )
@@ -372,13 +443,13 @@ def main() -> int:
 
     # warmup
     for i in range(warmup):
-        task_q.put((seeds[i], str(uuid.uuid4())))
+        task_q.put((seeds[i], str(uuid.uuid4()), i))
     time.sleep(0.1)
 
     # main
     t_begin = time.perf_counter()
     for i in range(total):
-        task_q.put((seeds[warmup + i], str(uuid.uuid4())))
+        task_q.put((seeds[warmup + i], str(uuid.uuid4()), warmup + i))
 
     for _ in range(conc):
         task_q.put(None)
