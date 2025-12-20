@@ -54,6 +54,87 @@ DEFAULT_NUM_GPUS = 2
 DEFAULT_ATTENTION_BACKEND = "torch_sdpa"
 
 
+def _maybe_save_output(output_batch, req) -> None:
+    """
+    Save outputs to disk for ZMQ benchmark mode.
+
+    NOTE:
+    - In DiffGenerator.generate(), saving happens on the *client side* after receiving OutputBatch.
+    - bench_concurrency.py previously discarded recv_pyobj(), so save_output had no effect.
+    """
+    try:
+        if not getattr(req, "save_output", False):
+            return
+        if output_batch is None or getattr(output_batch, "output", None) is None:
+            return
+
+        import imageio
+        import numpy as np
+        import torchvision
+        from einops import rearrange
+        from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+
+        fps = getattr(req, "fps", None) or 8
+        outputs = output_batch.output
+
+        # Normalize outputs to a list of samples shaped [C, T, H, W] (or [C, H, W])
+        try:
+            import torch
+
+            if isinstance(outputs, torch.Tensor) and outputs.dim() == 5:
+                # [B, C, T, H, W]
+                samples = [outputs[i] for i in range(outputs.shape[0])]
+            else:
+                samples = list(outputs)
+        except Exception:
+            samples = list(outputs) if isinstance(outputs, (list, tuple)) else [outputs]
+
+        num_outputs = len(samples)
+
+        for output_idx, sample in enumerate(samples):
+            try:
+                import torch
+
+                if isinstance(sample, torch.Tensor):
+                    sample = sample.detach().float().cpu()
+                else:
+                    continue
+
+                # align with DiffGenerator.post_process_sample()
+                if sample.dim() == 3:
+                    sample = sample.unsqueeze(1)  # [C,H,W] -> [C,1,H,W]
+                sample = rearrange(sample, "c t h w -> t c h w")
+
+                frames = []
+                for x in sample:
+                    x = torchvision.utils.make_grid(x, nrow=6)
+                    x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
+                    frames.append((x * 255).numpy().astype(np.uint8))
+
+                save_file_path = req.output_file_path(num_outputs, output_idx)
+                if not save_file_path:
+                    out_dir = getattr(req, "output_path", "outputs/")
+                    save_file_path = os.path.join(
+                        out_dir, f"{req.request_id}_{output_idx}.png"
+                    )
+
+                os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
+                if getattr(req, "data_type", None) == DataType.VIDEO:
+                    imageio.mimsave(
+                        save_file_path,
+                        frames,
+                        fps=int(fps),
+                        format=DataType.VIDEO.get_default_extension(),
+                    )
+                else:
+                    imageio.imwrite(save_file_path, frames[0])
+            except Exception:
+                continue
+    except Exception:
+        # Benchmark should not fail due to saving.
+        return
+
+
 def _percentile(sorted_vals: List[float], q: float) -> float:
     if not sorted_vals:
         return float("nan")
@@ -130,7 +211,8 @@ def _worker_main(
 
             t0 = time.perf_counter()
             sock.send_pyobj([req])
-            _ = sock.recv_pyobj()
+            output_batch = sock.recv_pyobj()
+            _maybe_save_output(output_batch, req)
             latencies.append(time.perf_counter() - t0)
             ok += 1
         except Exception as e:
