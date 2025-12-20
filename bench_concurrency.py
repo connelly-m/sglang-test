@@ -172,6 +172,28 @@ def main() -> int:
     ap.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)
     ap.add_argument("--num-gpus", type=int, default=DEFAULT_NUM_GPUS)
     ap.add_argument("--attention-backend", type=str, default=DEFAULT_ATTENTION_BACKEND)
+    # VAE decode 性能/显存相关：
+    # - vae_cpu_offload=True 会让 DecodingStage 在 CPU 上跑 VAE.decode（通常非常慢）
+    # - 建议：--no-vae-cpu-offload + --vae-precision bf16 + --vae-tiling
+    ap.add_argument(
+        "--vae-cpu-offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to offload VAE to CPU (and thus decode on CPU). Default: False (decode on GPU).",
+    )
+    ap.add_argument(
+        "--vae-precision",
+        type=str,
+        default="bf16",
+        choices=["fp32", "fp16", "bf16"],
+        help="VAE weights/compute precision. Default: bf16.",
+    )
+    ap.add_argument(
+        "--vae-tiling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable VAE tiling to reduce peak VRAM during decode. Default: True.",
+    )
 
     ap.add_argument("--start-server", action="store_true")
     ap.add_argument("--scheduler-host", type=str, default=None)
@@ -191,6 +213,10 @@ def main() -> int:
         tp_size=int(args.tp_size),
         num_gpus=int(args.num_gpus),
         attention_backend=args.attention_backend,
+        vae_cpu_offload=bool(args.vae_cpu_offload),
+        # PipelineConfig fields (PipelineConfig.from_kwargs 会从 kwargs 里读出来)
+        vae_precision=str(args.vae_precision),
+        vae_tiling=bool(args.vae_tiling),
         host=None,
         port=None,
     )
